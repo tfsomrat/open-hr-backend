@@ -9,12 +9,25 @@ export const authenticationSchema = new mongoose.Schema<AuthenticationType>(
       required: true,
       unique: true,
     },
-    refresh_token: {
-      type: String,
+    max_device: {
+      type: Number,
       required: true,
+      default: 3,
     },
+    refresh_tokens: [
+      {
+        token: {
+          type: String,
+          required: true,
+        },
+        device: {
+          type: String,
+          required: true,
+        },
+      },
+    ],
     pass_reset_token: {
-      token: {
+      otp_hash: {
         type: String,
       },
       expires: {

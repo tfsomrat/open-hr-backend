@@ -9,8 +9,41 @@ import { Employee } from "../employee/employee.model";
 import { Authentication } from "./authentication.model";
 import { AuthenticationType } from "./authentication.type";
 
+// Helper to update refresh tokens for a user
+const updateRefreshTokens = async (
+  userId: string,
+  device: string,
+  refreshToken: string
+) => {
+  const newTokenEntry = {
+    token: refreshToken,
+    device: device,
+  };
+
+  let authDoc = await Authentication.findOne({ user_id: userId });
+  if (authDoc) {
+    let tokens = authDoc.refresh_tokens || [];
+    if (tokens.length >= authDoc.max_device) {
+      tokens.shift();
+    }
+    tokens.push(newTokenEntry);
+    authDoc.refresh_tokens = tokens;
+    await authDoc.save();
+  } else {
+    await Authentication.create({
+      user_id: userId,
+      max_device: 3,
+      refresh_tokens: [newTokenEntry],
+    });
+  }
+};
+
 // password login
-const passwordLoginService = async (email: string, password: string) => {
+const passwordLoginService = async (
+  email: string,
+  password: string,
+  device: string
+) => {
   const isUserExist = await Employee.findOne({ work_email: email });
 
   if (!isUserExist) throw Error("User not found");
@@ -42,12 +75,7 @@ const passwordLoginService = async (email: string, password: string) => {
     variables.jwt_refresh_expire as string
   );
 
-  // Update with upsert to avoid race conditions
-  await Authentication.findOneAndUpdate(
-    { user_id: isUserExist.id },
-    { $set: { refresh_token: refreshToken } },
-    { upsert: true, new: true }
-  );
+  await updateRefreshTokens(isUserExist.id, device, refreshToken);
 
   const userDetails = {
     userId: isUserExist.id as string,
@@ -63,7 +91,7 @@ const passwordLoginService = async (email: string, password: string) => {
 };
 
 // oauth login
-const oauthLoginService = async (email: string) => {
+const oauthLoginService = async (email: string, device: string) => {
   const isUserExist = await Employee.findOne({ work_email: email });
 
   if (!isUserExist) {
@@ -92,12 +120,7 @@ const oauthLoginService = async (email: string) => {
     variables.jwt_refresh_expire as string
   );
 
-  // save refresh token to database
-  await Authentication.findOneAndUpdate(
-    { user_id: isUserExist.id },
-    { $set: { refresh_token: refreshToken } },
-    { upsert: true, new: true }
-  );
+  await updateRefreshTokens(isUserExist.id, device, refreshToken);
 
   userDetails.accessToken = accessToken;
   userDetails.refreshToken = refreshToken;
@@ -106,7 +129,7 @@ const oauthLoginService = async (email: string) => {
 };
 
 // token login
-const tokenLoginService = async (token: string) => {
+const tokenLoginService = async (token: string, device: string) => {
   const decodedToken = jwtHelpers.verifyToken(
     token,
     variables.jwt_secret as Secret
@@ -141,12 +164,7 @@ const tokenLoginService = async (token: string) => {
     variables.jwt_refresh_expire as string
   );
 
-  // save refresh token to database
-  await Authentication.findOneAndUpdate(
-    { user_id: employee.id },
-    { $set: { refresh_token: refreshToken } },
-    { upsert: true, new: true }
-  );
+  await updateRefreshTokens(employee.id, device, refreshToken);
 
   userDetails.accessToken = accessToken;
   userDetails.refreshToken = refreshToken;
@@ -179,7 +197,7 @@ const sendVerificationOtp = async (
 
   const userVerification = {
     pass_reset_token: {
-      token: await bcrypt.hash(otp, variables.salt),
+      otp_hash: await bcrypt.hash(otp, variables.salt),
       expires: expiringTime,
     },
   };
@@ -210,7 +228,7 @@ const verifyOtpService = async (
       throw Error("OTP not found");
     } else {
       const userId = verificationToken.user_id;
-      const { token: hashedOtp, expires } =
+      const { otp_hash: hashedOtp, expires } =
         verificationToken.pass_reset_token || {};
 
       // Check if the OTP is still valid
@@ -329,7 +347,10 @@ const resendOtpService = async (email: string, currentTime: string) => {
 const refreshTokenCache = new NodeCache({ stdTTL: 10 });
 
 // refresh token service
-export const refreshTokenService = async (refreshToken: string) => {
+export const refreshTokenService = async (
+  refreshToken: string,
+  device: string
+) => {
   if (!refreshToken) {
     throw new Error("Refresh token is required");
   }
@@ -362,33 +383,34 @@ export const refreshTokenService = async (refreshToken: string) => {
     }
 
     // Find user's token in database
-    let storedToken: AuthenticationType | null = null;
-    try {
-      // Add retry logic for database operations
-      let retries = 3;
-      while (retries > 0) {
-        try {
-          storedToken = await Authentication.findOne({ user_id: userId });
-          break; // If successful, exit the retry loop
-        } catch (err) {
-          retries--;
-          if (retries === 0) throw err;
-          await new Promise((resolve) => setTimeout(resolve, 100)); // Wait 100ms before retrying
-        }
+    let authDoc: any = null;
+    let retries = 3;
+    while (retries > 0) {
+      try {
+        authDoc = await Authentication.findOne({ user_id: userId });
+        break;
+      } catch (err) {
+        retries--;
+        if (retries === 0) throw err;
+        await new Promise((resolve) => setTimeout(resolve, 100));
       }
-    } catch (dbError: any) {
-      throw new Error(`Database error: ${dbError.message}`);
     }
 
-    if (!storedToken) {
+    if (!authDoc) {
       throw new Error("User not found");
     }
 
-    // force logout if token is not valid
-    if (!storedToken || !storedToken.refresh_token) {
-      console.error(`No valid authentication record found for user: ${userId}`);
+    // Check if the provided refreshToken exists in refresh_tokens array
+    const tokenIndex = authDoc.refresh_tokens.findIndex(
+      (entry: any) => entry.token === refreshToken
+    );
+    if (tokenIndex === -1) {
+      console.error(`No valid refresh token found for user: ${userId}`);
       throw new Error("User has been logged out");
     }
+
+    // Remove the old token
+    authDoc.refresh_tokens.splice(tokenIndex, 1);
 
     // Generate new tokens
     const newAccessToken = jwtHelpers.createToken(
@@ -409,23 +431,17 @@ export const refreshTokenService = async (refreshToken: string) => {
       variables.jwt_refresh_expire as string
     );
 
-    // Update token in database
-    let updatedAuth: AuthenticationType | null;
-    try {
-      updatedAuth = await Authentication.findOneAndUpdate(
-        { user_id: userId },
-        { refresh_token: newRefreshToken },
-        { new: true }
-      );
-    } catch (updateError: any) {
-      throw new Error(`Database update error: ${updateError.message}`);
-    }
+    // Add the new token to the array
+    const newTokenEntry = {
+      token: newRefreshToken,
+      device: device,
+    };
 
-    if (!updatedAuth) {
-      throw new Error(
-        "Authentication record not found or could not be updated"
-      );
+    if (authDoc.refresh_tokens.length >= authDoc.max_device) {
+      authDoc.refresh_tokens.shift();
     }
+    authDoc.refresh_tokens.push(newTokenEntry);
+    await authDoc.save();
 
     const responseData = {
       accessToken: newAccessToken,

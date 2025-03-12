@@ -20,7 +20,8 @@ const authentication_service_1 = require("./authentication.service");
 // password login
 const passwordLoginController = (0, catchAsync_1.default)((req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const { email, password } = req.body;
-    const user = yield authentication_service_1.authenticationService.passwordLoginService(email, password);
+    const device = req.headers["x-device-name"] || "unknown";
+    const user = yield authentication_service_1.authenticationService.passwordLoginService(email, password, device);
     (0, sendResponse_1.sendResponse)(res, {
         success: true,
         statusCode: 200,
@@ -31,7 +32,8 @@ const passwordLoginController = (0, catchAsync_1.default)((req, res) => __awaite
 // oauth login
 const oauthLoginController = (0, catchAsync_1.default)((req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const { email } = req.body;
-    const user = yield authentication_service_1.authenticationService.oauthLoginService(email);
+    const device = req.headers["x-device-name"] || "unknown";
+    const user = yield authentication_service_1.authenticationService.oauthLoginService(email, device);
     (0, sendResponse_1.sendResponse)(res, {
         success: true,
         statusCode: 200,
@@ -42,7 +44,8 @@ const oauthLoginController = (0, catchAsync_1.default)((req, res) => __awaiter(v
 // token login
 const tokenLoginController = (0, catchAsync_1.default)((req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const { token } = req.body;
-    const userDetails = yield authentication_service_1.authenticationService.tokenLoginService(token);
+    const device = req.headers["x-device-name"] || "unknown";
+    const userDetails = yield authentication_service_1.authenticationService.tokenLoginService(token, device);
     (0, sendResponse_1.sendResponse)(res, {
         success: true,
         statusCode: 200,
@@ -101,7 +104,8 @@ const resendOtpController = (0, catchAsync_1.default)((req, res) => __awaiter(vo
 // refresh token
 const refreshTokenController = (0, catchAsync_1.default)((req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const { refreshToken } = req.body;
-    const token = yield authentication_service_1.authenticationService.refreshTokenService(refreshToken);
+    const device = req.headers["x-device-name"] || "unknown";
+    const token = yield authentication_service_1.authenticationService.refreshTokenService(refreshToken, device);
     (0, sendResponse_1.sendResponse)(res, {
         success: true,
         statusCode: 200,

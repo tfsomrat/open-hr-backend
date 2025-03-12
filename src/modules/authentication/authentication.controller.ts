@@ -8,9 +8,11 @@ import { authenticationService } from "./authentication.service";
 const passwordLoginController = catchAsync(
   async (req: Request, res: Response) => {
     const { email, password } = req.body;
+    const device = (req.headers["x-device-name"] as string) || "unknown";
     const user = await authenticationService.passwordLoginService(
       email,
-      password
+      password,
+      device
     );
 
     sendResponse(res, {
@@ -25,7 +27,8 @@ const passwordLoginController = catchAsync(
 // oauth login
 const oauthLoginController = catchAsync(async (req: Request, res: Response) => {
   const { email } = req.body;
-  const user = await authenticationService.oauthLoginService(email);
+  const device = (req.headers["x-device-name"] as string) || "unknown";
+  const user = await authenticationService.oauthLoginService(email, device);
 
   sendResponse(res, {
     success: true,
@@ -38,7 +41,11 @@ const oauthLoginController = catchAsync(async (req: Request, res: Response) => {
 // token login
 const tokenLoginController = catchAsync(async (req: Request, res: Response) => {
   const { token } = req.body;
-  const userDetails = await authenticationService.tokenLoginService(token);
+  const device = (req.headers["x-device-name"] as string) || "unknown";
+  const userDetails = await authenticationService.tokenLoginService(
+    token,
+    device
+  );
 
   sendResponse(res, {
     success: true,
@@ -115,7 +122,11 @@ const resendOtpController = catchAsync(async (req, res) => {
 const refreshTokenController = catchAsync(
   async (req: Request, res: Response) => {
     const { refreshToken } = req.body;
-    const token = await authenticationService.refreshTokenService(refreshToken);
+    const device = (req.headers["x-device-name"] as string) || "unknown";
+    const token = await authenticationService.refreshTokenService(
+      refreshToken,
+      device
+    );
     sendResponse(res, {
       success: true,
       statusCode: 200,
