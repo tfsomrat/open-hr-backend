@@ -7,7 +7,7 @@ import mongoose from "mongoose";
 import NodeCache from "node-cache";
 import { Employee } from "../employee/employee.model";
 import { Authentication } from "./authentication.model";
-import { AuthenticationType } from "./authentication.type";
+import { AuthenticationType, RefreshTokenType } from "./authentication.type";
 
 // Helper to update refresh tokens for a user
 const updateRefreshTokens = async (
@@ -22,17 +22,27 @@ const updateRefreshTokens = async (
 
   let authDoc = await Authentication.findOne({ user_id: userId });
   if (authDoc) {
-    let tokens = authDoc.refresh_tokens || [];
-    if (tokens.length >= authDoc.max_device) {
-      tokens.shift();
+    // First check if this device already exists
+    const existingDeviceIndex = authDoc.refresh_tokens.findIndex(
+      (entry: RefreshTokenType) => entry.device === device
+    );
+
+    if (existingDeviceIndex !== -1) {
+      // Update existing device token
+      authDoc.refresh_tokens[existingDeviceIndex].token = refreshToken;
+    } else {
+      // Add new device, but enforce max_device limit
+      if (authDoc.refresh_tokens.length >= authDoc.max_device) {
+        authDoc.refresh_tokens.shift();
+      }
+      authDoc.refresh_tokens.push(newTokenEntry);
     }
-    tokens.push(newTokenEntry);
-    authDoc.refresh_tokens = tokens;
+
     await authDoc.save();
   } else {
+    // Create new auth document
     await Authentication.create({
       user_id: userId,
-      max_device: 3,
       refresh_tokens: [newTokenEntry],
     });
   }
@@ -355,6 +365,10 @@ export const refreshTokenService = async (
     throw new Error("Refresh token is required");
   }
 
+  if (!device) {
+    throw new Error("Device identifier is required");
+  }
+
   try {
     // Verify token
     let decodedToken: JwtPayload;
@@ -373,8 +387,8 @@ export const refreshTokenService = async (
       throw new Error("Invalid token payload");
     }
 
-    // Create a user-specific cache key
-    const cacheKey = `user:${userId}`;
+    // Create a device-specific cache key
+    const cacheKey = `user:${userId}:device:${device}`;
 
     // Check for cached response
     const cached = refreshTokenCache.get(cacheKey);
@@ -382,13 +396,92 @@ export const refreshTokenService = async (
       return cached;
     }
 
-    // Find user's token in database
+    // Find user's auth record in database with retry logic
     let authDoc: any = null;
     let retries = 3;
     while (retries > 0) {
       try {
-        authDoc = await Authentication.findOne({ user_id: userId });
-        break;
+        // Use a transaction to ensure atomic updates
+        const session = await Authentication.startSession();
+        session.startTransaction();
+
+        try {
+          authDoc = await Authentication.findOne({ user_id: userId }).session(
+            session
+          );
+
+          if (!authDoc) {
+            await session.abortTransaction();
+            session.endSession();
+            throw new Error("User not found");
+          }
+
+          // Check if the provided refreshToken exists in refresh_tokens array
+          const tokenIndex = authDoc.refresh_tokens.findIndex(
+            (entry: RefreshTokenType) => entry.token === refreshToken
+          );
+
+          if (tokenIndex === -1) {
+            await session.abortTransaction();
+            session.endSession();
+            throw new Error("User has been logged out");
+          }
+
+          // Remove the old token
+          authDoc.refresh_tokens.splice(tokenIndex, 1);
+
+          // Generate new tokens
+          const newAccessToken = jwtHelpers.createToken(
+            {
+              id: userId,
+              role: role,
+            },
+            variables.jwt_secret as Secret,
+            variables.jwt_expire as string
+          );
+
+          const newRefreshToken = jwtHelpers.createToken(
+            {
+              id: userId,
+              role: role,
+            },
+            variables.jwt_refresh_secret as Secret,
+            variables.jwt_refresh_expire as string
+          );
+
+          // Add the new token to the array
+          const newTokenEntry = {
+            token: newRefreshToken,
+            device: device,
+          };
+
+          authDoc.refresh_tokens.push(newTokenEntry);
+
+          // Ensure we don't exceed max_device limit
+          if (authDoc.refresh_tokens.length > authDoc.max_device) {
+            // Remove the oldest token(s) to maintain limit
+            const excess = authDoc.refresh_tokens.length - authDoc.max_device;
+            authDoc.refresh_tokens.splice(0, excess);
+          }
+
+          await authDoc.save({ session });
+          await session.commitTransaction();
+          session.endSession();
+
+          const responseData = {
+            accessToken: newAccessToken,
+            refreshToken: newRefreshToken,
+          };
+
+          // Cache the response using device-specific key
+          refreshTokenCache.set(cacheKey, responseData);
+
+          return responseData;
+        } catch (error) {
+          await session.abortTransaction();
+          session.endSession();
+          throw error;
+        }
       } catch (err) {
         retries--;
         if (retries === 0) throw err;
@@ -396,62 +489,7 @@ export const refreshTokenService = async (
       }
     }
 
-    if (!authDoc) {
-      throw new Error("User not found");
-    }
-
-    // Check if the provided refreshToken exists in refresh_tokens array
-    const tokenIndex = authDoc.refresh_tokens.findIndex(
-      (entry: any) => entry.token === refreshToken
-    );
-    if (tokenIndex === -1) {
-      console.error(`No valid refresh token found for user: ${userId}`);
-      throw new Error("User has been logged out");
-    }
-
-    // Remove the old token
-    authDoc.refresh_tokens.splice(tokenIndex, 1);
-
-    // Generate new tokens
-    const newAccessToken = jwtHelpers.createToken(
-      {
-        id: userId,
-        role: role,
-      },
-      variables.jwt_secret as Secret,
-      variables.jwt_expire as string
-    );
-
-    const newRefreshToken = jwtHelpers.createToken(
-      {
-        id: userId,
-        role: role,
-      },
-      variables.jwt_refresh_secret as Secret,
-      variables.jwt_refresh_expire as string
-    );
-
-    // Add the new token to the array
-    const newTokenEntry = {
-      token: newRefreshToken,
-      device: device,
-    };
-
-    if (authDoc.refresh_tokens.length >= authDoc.max_device) {
-      authDoc.refresh_tokens.shift();
-    }
-    authDoc.refresh_tokens.push(newTokenEntry);
-    await authDoc.save();
-
-    const responseData = {
-      accessToken: newAccessToken,
-      refreshToken: newRefreshToken,
-    };
-
-    // Cache the response using just the user ID
-    refreshTokenCache.set(cacheKey, responseData);
-
-    return responseData;
+    throw new Error("Could not complete database operation after retries");
   } catch (error: any) {
     console.error("Refresh token error:", error.message);
     throw new Error("Invalid refresh token");

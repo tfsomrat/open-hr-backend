@@ -29,18 +29,25 @@ const updateRefreshTokens = (userId, device, refreshToken) => __awaiter(void 0, 
     };
     let authDoc = yield authentication_model_1.Authentication.findOne({ user_id: userId });
     if (authDoc) {
-        let tokens = authDoc.refresh_tokens || [];
-        if (tokens.length >= authDoc.max_device) {
-            tokens.shift();
+        // First check if this device already exists
+        const existingDeviceIndex = authDoc.refresh_tokens.findIndex((entry) => entry.device === device);
+        if (existingDeviceIndex !== -1) {
+            // Update existing device token
+            authDoc.refresh_tokens[existingDeviceIndex].token = refreshToken;
         }
-        tokens.push(newTokenEntry);
-        authDoc.refresh_tokens = tokens;
+        else {
+            // Add new device, but enforce max_device limit
+            if (authDoc.refresh_tokens.length >= authDoc.max_device) {
+                authDoc.refresh_tokens.shift();
+            }
+            authDoc.refresh_tokens.push(newTokenEntry);
+        }
         yield authDoc.save();
     }
     else {
+        // Create new auth document
         yield authentication_model_1.Authentication.create({
             user_id: userId,
-            max_device: 3,
             refresh_tokens: [newTokenEntry],
         });
     }
@@ -256,6 +263,9 @@ const refreshTokenService = (refreshToken, device) => __awaiter(void 0, void 0, 
     if (!refreshToken) {
         throw new Error("Refresh token is required");
     }
+    if (!device) {
+        throw new Error("Device identifier is required");
+    }
     try {
         // Verify token
         let decodedToken;
@@ -270,20 +280,74 @@ const refreshTokenService = (refreshToken, device) => __awaiter(void 0, void 0, 
         if (!userId) {
             throw new Error("Invalid token payload");
         }
-        // Create a user-specific cache key
-        const cacheKey = `user:${userId}`;
+        // Create a device-specific cache key
+        const cacheKey = `user:${userId}:device:${device}`;
         // Check for cached response
         const cached = refreshTokenCache.get(cacheKey);
         if (cached) {
             return cached;
         }
-        // Find user's token in database
+        // Find user's auth record in database with retry logic
         let authDoc = null;
         let retries = 3;
         while (retries > 0) {
             try {
-                authDoc = yield authentication_model_1.Authentication.findOne({ user_id: userId });
-                break;
+                // Use a transaction to ensure atomic updates
+                const session = yield authentication_model_1.Authentication.startSession();
+                session.startTransaction();
+                try {
+                    authDoc = yield authentication_model_1.Authentication.findOne({ user_id: userId }).session(session);
+                    if (!authDoc) {
+                        yield session.abortTransaction();
+                        session.endSession();
+                        throw new Error("User not found");
+                    }
+                    // Check if the provided refreshToken exists in refresh_tokens array
+                    const tokenIndex = authDoc.refresh_tokens.findIndex((entry) => entry.token === refreshToken);
+                    if (tokenIndex === -1) {
+                        yield session.abortTransaction();
+                        session.endSession();
+                        throw new Error("User has been logged out");
+                    }
+                    // Remove the old token
+                    authDoc.refresh_tokens.splice(tokenIndex, 1);
+                    // Generate new tokens
+                    const newAccessToken = jwtTokenHelper_1.jwtHelpers.createToken({
+                        id: userId,
+                        role: role,
+                    }, variables_1.default.jwt_secret, variables_1.default.jwt_expire);
+                    const newRefreshToken = jwtTokenHelper_1.jwtHelpers.createToken({
+                        id: userId,
+                        role: role,
+                    }, variables_1.default.jwt_refresh_secret, variables_1.default.jwt_refresh_expire);
+                    // Add the new token to the array
+                    const newTokenEntry = {
+                        token: newRefreshToken,
+                        device: device,
+                    };
+                    authDoc.refresh_tokens.push(newTokenEntry);
+                    // Ensure we don't exceed max_device limit
+                    if (authDoc.refresh_tokens.length > authDoc.max_device) {
+                        // Remove the oldest token(s) to maintain limit
+                        const excess = authDoc.refresh_tokens.length - authDoc.max_device;
+                        authDoc.refresh_tokens.splice(0, excess);
+                    }
+                    yield authDoc.save({ session });
+                    yield session.commitTransaction();
+                    session.endSession();
+                    const responseData = {
+                        accessToken: newAccessToken,
+                        refreshToken: newRefreshToken,
+                    };
+                    // Cache the response using device-specific key
+                    refreshTokenCache.set(cacheKey, responseData);
+                    return responseData;
+                }
+                catch (error) {
+                    yield session.abortTransaction();
+                    session.endSession();
+                    throw error;
+                }
             }
             catch (err) {
                 retries--;
@@ -292,43 +356,7 @@ const refreshTokenService = (refreshToken, device) => __awaiter(void 0, void 0, 
                 yield new Promise((resolve) => setTimeout(resolve, 100));
             }
         }
-        if (!authDoc) {
-            throw new Error("User not found");
-        }
-        // Check if the provided refreshToken exists in refresh_tokens array
-        const tokenIndex = authDoc.refresh_tokens.findIndex((entry) => entry.token === refreshToken);
-        if (tokenIndex === -1) {
-            console.error(`No valid refresh token found for user: ${userId}`);
-            throw new Error("User has been logged out");
-        }
-        // Remove the old token
-        authDoc.refresh_tokens.splice(tokenIndex, 1);
-        // Generate new tokens
-        const newAccessToken = jwtTokenHelper_1.jwtHelpers.createToken({
-            id: userId,
-            role: role,
-        }, variables_1.default.jwt_secret, variables_1.default.jwt_expire);
-        const newRefreshToken = jwtTokenHelper_1.jwtHelpers.createToken({
-            id: userId,
-            role: role,
-        }, variables_1.default.jwt_refresh_secret, variables_1.default.jwt_refresh_expire);
-        // Add the new token to the array
-        const newTokenEntry = {
-            token: newRefreshToken,
-            device: device,
-        };
-        if (authDoc.refresh_tokens.length >= authDoc.max_device) {
-            authDoc.refresh_tokens.shift();
-        }
-        authDoc.refresh_tokens.push(newTokenEntry);
-        yield authDoc.save();
-        const responseData = {
-            accessToken: newAccessToken,
-            refreshToken: newRefreshToken,
-        };
-        // Cache the response using just the user ID
-        refreshTokenCache.set(cacheKey, responseData);
-        return responseData;
+        throw new Error("Could not complete database operation after retries");
     }
     catch (error) {
         console.error("Refresh token error:", error.message);
